@@ -6,18 +6,22 @@ import pandas as pd
 import io
 import os
 import math
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import MinMaxScaler   # ganti StandardScaler
+from kneed import KneeLocator 
 from flask import send_file
-
+from sklearn.metrics import silhouette_score
 
 app = Flask(__name__)
 app.secret_key = 'your_secret_key_here'  # Required for flash messages
 
-AI_KEY = os.getenv('GROQ_API_KEY', 'Your_API_KEY')
+AI_KEY = os.getenv('GROQ_API_KEY', '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')
 
 client = Groq(api_key=AI_KEY)
 
 # Global variable to store uploaded data
 uploaded_data = None
+clustered_data = None   # tambahan baru: menyimpan df_clean lengkap dengan kolom cluster & label
 
 def analyze_business_data(df):
     """Menganalisis data bisnis berdasarkan rating dan jumlah ulasan"""
@@ -42,6 +46,9 @@ def analyze_business_data(df):
 
         if 'nomor_telepon' not in df_clean.columns:
             df_clean['nomor_telepon'] = ''
+            
+        if 'nama' in df_clean.columns:
+            df_clean = df_clean.drop_duplicates(subset=['nama'])
         
         # Hapus baris dengan nilai NaN
         df_clean = df_clean.dropna(subset=['rating', 'jumlah_ulasan'])
@@ -121,6 +128,182 @@ def analyze_business_data(df):
             'min_reviews': int(df_clean['jumlah_ulasan'].min()) if not df_clean.empty else 0,
             'total_reviews': int(df_clean['jumlah_ulasan'].sum()) if not df_clean.empty else 0
         }
+
+        # Analisis 10: K-means clustering berdasarkan rating, jumlah ulasan, dan status website
+        cluster_analysis = {
+            'enabled': False,
+            'num_clusters': 0,
+            'clusters': [],
+            'cluster_centroids': [],
+            'cluster_sample': [],
+            'silhouette_score': None,
+            'elbow_k': None
+        }
+
+        try:
+            # Siapkan atribut website_status (1 jika ada website, 0 jika kosong)
+            df_clean['website_status'] = df_clean['website'].apply(
+                lambda x: 1 if isinstance(x, str) and x.strip() != '' else 0
+            )
+
+            # Minimal data untuk clustering yang bermakna
+            if len(df_clean) >= 6:
+                features = df_clean[['rating', 'jumlah_ulasan', 'website_status']].copy()
+
+                if features['rating'].nunique() >= 2 or features['jumlah_ulasan'].nunique() >= 2:
+                    # --- Normalisasi (sesuai Colab: MinMaxScaler) ---
+                    scaler = MinMaxScaler()
+                    features_scaled = scaler.fit_transform(features)
+
+                    # --- Elbow Method otomatis ---
+                    max_k = min(10, len(df_clean) - 1)  # batasi K agar tidak melebihi jumlah data
+                    k_range = list(range(1, max_k + 1))
+                    inertia = []
+
+                    for k_test in k_range:
+                        km_test = KMeans(
+                            n_clusters=k_test,
+                            random_state=42,
+                            n_init=10,
+                            init='k-means++'
+                        )
+                        km_test.fit(features_scaled)
+                        inertia.append(km_test.inertia_)
+
+                    # Deteksi titik elbow; fallback ke K=2 jika gagal terdeteksi atau data sedikit
+                    elbow_k = None
+                    if len(k_range) >= 3:
+                        try:
+                            knee = KneeLocator(
+                                k_range, inertia,
+                                curve='convex', direction='decreasing'
+                            )
+                            elbow_k = knee.elbow
+                        except Exception:
+                            elbow_k = None
+
+                    if elbow_k is None or elbow_k < 2:
+                        elbow_k = 2 if max_k >= 2 else 1
+
+                    # --- Validasi dengan Silhouette Score ---
+                    best_k = elbow_k
+                    best_score = None
+
+                    if max_k >= 2:
+                        silhouette_results = {}
+                        for k_test in range(2, max_k + 1):
+                            km_test = KMeans(
+                                n_clusters=k_test,
+                                random_state=42,
+                                n_init=10,
+                                init='k-means++'
+                            )
+                            labels_test = km_test.fit_predict(features_scaled)
+                            score = silhouette_score(features_scaled, labels_test)
+                            silhouette_results[k_test] = score
+
+                        # Pilih K dengan silhouette tertinggi sebagai validasi akhir
+                        best_k = max(silhouette_results, key=silhouette_results.get)
+                        best_score = silhouette_results[best_k]
+
+                    n_clusters = best_k
+
+                    # --- K-Means final dengan K tervalidasi ---
+                    kmeans = KMeans(
+                        n_clusters=n_clusters,
+                        random_state=42,
+                        n_init=10,
+                        init='k-means++',
+                        max_iter=300
+                    )
+                    labels = kmeans.fit_predict(features_scaled)
+                    df_clean['cluster'] = labels
+
+                    if best_score is None and n_clusters >= 2:
+                        best_score = silhouette_score(features_scaled, labels)
+
+                    cluster_stats = df_clean.groupby('cluster').agg(
+                        count=('nama', 'count'),
+                        avg_rating=('rating', 'mean'),
+                        avg_reviews=('jumlah_ulasan', 'mean'),
+                        avg_website=('website_status', 'mean')
+                    ).reset_index()
+
+                    # Urutkan cluster berdasarkan rata-rata jumlah ulasan (indikator utama potensi,
+                    # konsisten dengan pendekatan ranking di notebook Colab)
+                    cluster_stats = cluster_stats.sort_values(
+                        by=['avg_reviews', 'avg_rating'], ascending=False
+                    ).reset_index(drop=True)
+
+                    # Label dinamis mengikuti jumlah cluster (bukan fixed 3 label lagi)
+                    label_map = {}
+                    total_clusters = len(cluster_stats)
+                    for rank, (_, row) in enumerate(cluster_stats.iterrows()):
+                        if total_clusters == 2:
+                            name = 'Potensi Tinggi' if rank == 0 else 'Potensi Standar'
+                        elif rank == 0:
+                            name = 'Potensi Tinggi'
+                        elif rank == total_clusters - 1:
+                            name = 'Potensi Rendah'
+                        else:
+                            name = 'Potensi Menengah'
+                        label_map[int(row['cluster'])] = name
+
+                    cluster_summary = []
+                    for _, row in cluster_stats.iterrows():
+                        cluster_summary.append({
+                            'cluster_id': int(row['cluster']),
+                            'label': label_map[int(row['cluster'])],
+                            'count': int(row['count']),
+                            'avg_rating': round(float(row['avg_rating']), 2),
+                            'avg_reviews': round(float(row['avg_reviews']), 2),
+                            'avg_website': round(float(row['avg_website']), 2)
+                        })
+
+                    # Centroid dikembalikan ke skala asli (inverse_transform sesuai MinMaxScaler)
+                    centroids = scaler.inverse_transform(kmeans.cluster_centers_)
+                    centroid_list = []
+                    for cluster_id, centroid in enumerate(centroids):
+                        centroid_list.append({
+                            'cluster_id': cluster_id,
+                            'avg_rating': round(float(centroid[0]), 2),
+                            'avg_reviews': round(float(centroid[1]), 2),
+                            'avg_website': round(float(centroid[2]), 2)
+                        })
+
+                    sample_businesses = []
+                    for cluster in cluster_summary:
+                        sample = df_clean[df_clean['cluster'] == cluster['cluster_id']]
+                        sample = sample.sort_values(
+                            by=['rating', 'jumlah_ulasan'], ascending=[False, False]
+                        ).head(3)
+                        sample_businesses.append({
+                            'cluster_id': cluster['cluster_id'],
+                            'label': cluster['label'],
+                            'top_businesses': sample['nama'].tolist()
+                        })
+
+                    cluster_analysis = {
+                        'enabled': True,
+                        'num_clusters': n_clusters,
+                        'clusters': cluster_summary,
+                        'cluster_centroids': centroid_list,
+                        'cluster_sample': sample_businesses,
+                        'silhouette_score': round(float(best_score), 4) if best_score is not None else None,
+                        'elbow_k': elbow_k
+                    }
+                    
+        except Exception as clustering_error:
+            print(f"KMeans clustering skipped: {clustering_error}")
+            cluster_analysis = {
+                'enabled': False,
+                'num_clusters': 0,
+                'clusters': [],
+                'cluster_centroids': [],
+                'cluster_sample': [],
+                'silhouette_score': None,
+                'elbow_k': None
+            }
         
         # Handle missing values in the series
         def get_series_value(series, key, default='Tidak tersedia'):
@@ -129,6 +312,27 @@ def analyze_business_data(df):
                 return value if not pd.isna(value) else default
             except:
                 return default
+            
+         # Siapkan data segmentasi final (untuk ditampilkan terurut per cluster)
+        segmentation_final = []
+        if cluster_analysis.get('enabled'):
+            label_lookup = {c['cluster_id']: c['label'] for c in cluster_analysis['clusters']}
+            df_seg = df_clean.copy()
+            df_seg['kategori_cluster'] = df_seg['cluster'].map(label_lookup)
+
+            # Urutkan: cluster dengan rata-rata ulasan tertinggi tampil duluan,
+            # lalu di dalam cluster diurutkan dari rating & ulasan tertinggi (sama seperti Colab)
+            cluster_order = [c['cluster_id'] for c in cluster_analysis['clusters']]  # sudah terurut desc
+            df_seg['cluster_rank'] = df_seg['cluster'].apply(lambda x: cluster_order.index(x))
+            df_seg = df_seg.sort_values(
+                by=['cluster_rank', 'rating', 'jumlah_ulasan'],
+                ascending=[True, False, False]
+            ).drop(columns=['cluster_rank'])
+
+            segmentation_final = df_seg[[
+                'nama', 'rating', 'jumlah_ulasan', 'website_status',
+                'cluster', 'kategori_cluster'
+            ]].to_dict('records')
         
         results = {
             'highest_rated': {
@@ -154,8 +358,11 @@ def analyze_business_data(df):
             'top_10_rating': top_10_rating,
             'top_10_reviews': top_10_reviews,
             'rating_distribution': rating_distribution,
+            'cluster_analysis': cluster_analysis,
+            'segmentation_final': segmentation_final,
             'raw_data': df_clean.to_dict('records')  # Semua data bersih
         }
+        
         
         return results, None
         
@@ -191,6 +398,19 @@ def ai_call(df, analysis_results):
         Ulasan: {analysis_results['lowest_rated']['jumlah_ulasan']},
         Kategori: {analysis_results['lowest_rated']['kategori']})
         """
+        if analysis_results.get('cluster_analysis', {}).get('enabled'):
+            cluster_lines = ['\nHasil clustering k-means:']
+            cluster_lines.append(f"- Jumlah cluster: {analysis_results['cluster_analysis']['num_clusters']}")
+            for cluster in analysis_results['cluster_analysis']['clusters']:
+                cluster_lines.append(
+                    f"- Cluster {cluster['cluster_id']} ({cluster['label']}): {cluster['count']} bisnis, rata-rata rating {cluster['avg_rating']}, rata-rata ulasan {cluster['avg_reviews']}"
+                )
+            for sample in analysis_results['cluster_analysis'].get('cluster_sample', []):
+                if sample.get('top_businesses'):
+                    cluster_lines.append(
+                        f"  Contoh bisnis cluster {sample['cluster_id']} ({sample['label']}): {', '.join(sample['top_businesses'])}"
+                    )
+            data_summary += '\n'.join(cluster_lines)
         
         chat_completion = client.chat.completions.create(
             messages=[
@@ -208,6 +428,7 @@ def ai_call(df, analysis_results):
                     4. Pola atau tren yang terlihat dari data
                     5. Insight tentang kategori usaha yang performa baik
                     6. Saran improvement untuk bisnis dengan rating rendah
+                    7. Interpretasi hasil clustering k-means: jelaskan karakteristik setiap cluster dan rekomendasi operasional untuk masing-masing
                     
                     Format respons dalam bahasa Indonesia dengan struktur yang jelas dan actionable insights.
                     """
@@ -255,20 +476,18 @@ def analyze_business():
             return redirect(request.url)
         
         try:
-            # Baca file CSV
             df = pd.read_csv(file)
-            
-            # Simpan data yang diupload untuk pencarian
             uploaded_data = df.copy()
-            
-            # Analisis data
+
             analysis_results, error = analyze_business_data(df)
-            
+
             if error:
                 flash(error, 'error')
                 return redirect(request.url)
-            
-            # Panggil AI untuk analisis lebih lanjut
+
+            # simpan hasil segmentasi final untuk dipakai di /get_all_data
+            clustered_data = analysis_results.get('segmentation_final', [])
+
             ai_output = ai_call(df, analysis_results)
             
             flash(f'Berhasil memuat {len(df)} data bisnis!', 'success')
@@ -295,50 +514,56 @@ def close_analysis():
     
     # Reset global data
     uploaded_data = None
+    clustered_data = None
     
     flash('Analisis telah ditutup. Anda dapat mengupload file baru untuk analisis.', 'info')
     return redirect(url_for('analyze_business'))
 
 @app.route('/get_all_data', methods=['GET'])
 def get_all_data():
-    global uploaded_data
-    
+    global uploaded_data, clustered_data
+
     if uploaded_data is None:
         return jsonify({'error': 'Tidak ada data yang diupload'})
-    
+
     try:
         page = int(request.args.get('page', 1))
         per_page = int(request.args.get('per_page', 50))
-        
-        # 🔥 Urutkan data dulu sebelum dipotong per halaman
-        df_sorted = uploaded_data.copy()
-        if "rating" in df_sorted.columns and "jumlah_ulasan" in df_sorted.columns:
-            df_sorted = df_sorted.sort_values(
-                by=["rating", "jumlah_ulasan"], 
-                ascending=[False, False]
-            )
-        
-        total_data = len(df_sorted)
-        total_pages = math.ceil(total_data / per_page)
-        
-        start_idx = (page - 1) * per_page
-        end_idx = start_idx + per_page
-        end_idx = min(end_idx, total_data)
-        
-        data_chunk = df_sorted.iloc[start_idx:end_idx]
-        
-        # Konversi ke dictionary (handle NaN)
-        data_records = []
-        for _, row in data_chunk.iterrows():
-            record = {}
-            for col in df_sorted.columns:
-                value = row[col]
-                record[col] = None if pd.isna(value) else value
-            data_records.append(record)
-        
+
+        # Prioritaskan data hasil segmentasi (sudah terurut per cluster),
+        # fallback ke data mentah jika clustering tidak tersedia
+        if clustered_data:
+            data_source = clustered_data
+            total_data = len(data_source)
+            total_pages = math.ceil(total_data / per_page)
+            start_idx = (page - 1) * per_page
+            end_idx = min(start_idx + per_page, total_data)
+            data_records = data_source[start_idx:end_idx]
+        else:
+            df_sorted = uploaded_data.copy()
+            if "rating" in df_sorted.columns and "jumlah_ulasan" in df_sorted.columns:
+                df_sorted = df_sorted.sort_values(
+                    by=["rating", "jumlah_ulasan"],
+                    ascending=[False, False]
+                )
+            total_data = len(df_sorted)
+            total_pages = math.ceil(total_data / per_page)
+            start_idx = (page - 1) * per_page
+            end_idx = min(start_idx + per_page, total_data)
+            data_chunk = df_sorted.iloc[start_idx:end_idx]
+
+            data_records = []
+            for _, row in data_chunk.iterrows():
+                record = {}
+                for col in df_sorted.columns:
+                    value = row[col]
+                    record[col] = None if pd.isna(value) else value
+                data_records.append(record)
+
         return jsonify({
             'success': True,
             'data': data_records,
+            'has_cluster': bool(clustered_data),
             'pagination': {
                 'page': page,
                 'per_page': per_page,
@@ -346,7 +571,7 @@ def get_all_data():
                 'total_data': total_data
             }
         })
-    
+
     except Exception as e:
         print(f"Get all data error: {e}")
         return jsonify({'error': f'Error mengambil data: {str(e)}'})
@@ -424,6 +649,19 @@ def download_results():
                 "Keterangan": f"{idx}. {row['nama']}",
                 "Nilai": f"Rating: {row['rating']} | Ulasan: {row['jumlah_ulasan']} | Kategori: {row.get('kategori_usaha', '-')} | Telepon: {row.get('nomor_telepon', '-')} | Website: {row.get('website', '-')}"
             })
+
+        if analysis_results.get('cluster_analysis', {}).get('enabled'):
+            export_data.append({
+                "Bagian": "Clustering K-Means",
+                "Keterangan": "Jumlah cluster",
+                "Nilai": analysis_results['cluster_analysis']['num_clusters']
+            })
+            for cluster in analysis_results['cluster_analysis']['clusters']:
+                export_data.append({
+                    "Bagian": "Clustering K-Means",
+                    "Keterangan": f"Cluster {cluster['cluster_id']} ({cluster['label']})",
+                    "Nilai": f"Count: {cluster['count']} | Avg Rating: {cluster['avg_rating']} | Avg Reviews: {cluster['avg_reviews']}"
+                })
 
         # Convert ke DataFrame
         df_export = pd.DataFrame(export_data)
