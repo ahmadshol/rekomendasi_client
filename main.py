@@ -2,6 +2,7 @@ from flask import Flask, render_template, request, flash, redirect, url_for, jso
 from flask import send_from_directory
 from datetime import datetime
 from groq import Groq
+from groq import APIStatusError  
 import pandas as pd
 import io
 import os
@@ -11,13 +12,37 @@ from sklearn.preprocessing import MinMaxScaler   # ganti StandardScaler
 from kneed import KneeLocator 
 from flask import send_file
 from sklearn.metrics import silhouette_score
+from dotenv import load_dotenv
 
 app = Flask(__name__)
-app.secret_key = 'your_secret_key_here'  # Required for flash messages
+load_dotenv()
+app.secret_key = os.getenv('SECRET_KEY', 'flask-pm-secret-key')
 
-AI_KEY = os.getenv('GROQ_API_KEY', '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')
+AI_KEY = os.getenv('GROQ_API_KEY')
+GROQ_MODELS = [
+    'openai/gpt-oss-20b',
+    'openai/gpt-oss-120b',
+]
 
-client = Groq(api_key=AI_KEY)
+client = Groq(api_key=AI_KEY) if AI_KEY else None
+
+
+def get_available_groq_models():
+    if client is None:
+        return []
+
+    try:
+        model_list = client.models.list()
+        items = getattr(model_list, 'data', []) or []
+        model_ids = []
+        for item in items:
+            model_id = getattr(item, 'id', None)
+            if model_id:
+                model_ids.append(model_id)
+        return model_ids
+    except Exception as exc:
+        print(f"Tidak bisa mengambil daftar model Groq: {exc}")
+        return []
 
 # Global variable to store uploaded data
 uploaded_data = None
@@ -371,79 +396,178 @@ def analyze_business_data(df):
         print(f"Error in analyze_business_data: {str(e)}")
         print(traceback.format_exc())
         return None, f"Error dalam menganalisis data: {str(e)}"
+    
+def get_permitted_models():
+    """
+    Ambil daftar model yang benar2 diizinkan di project Groq,
+    lalu irisan-kan dengan daftar model yang ingin kita pakai.
+    Kalau gagal fetch, fallback ke daftar hardcode.
+    """
+    preferred = ['llama-3.1-8b-instant', 'llama-3.3-70b-versatile']
+    available = get_available_groq_models()
 
+    if not available:
+        # gagal ambil daftar dari API -> pakai daftar preferred apa adanya
+        return preferred
+
+    # hanya pakai model yang memang ada di daftar available
+    filtered = [m for m in preferred if m in available]
+    return filtered if filtered else preferred
+    
 def ai_call(df, analysis_results):
-    """Meminta analisis AI berdasarkan data dan hasil analisis"""
+    """Meminta analisis AI berdasarkan data dan hasil analisis."""
     try:
-        # Siapkan ringkasan data untuk AI
+        if client is None:
+            return (
+                "GROQ_API_KEY belum diatur. "
+                "Tambahkan variabel environment GROQ_API_KEY "
+                "agar analisis AI bisa berjalan."
+            )
+
         data_summary = f"""
         Data bisnis yang dianalisis:
         - Total bisnis: {analysis_results['statistics']['total_businesses']}
         - Rata-rata rating: {analysis_results['statistics']['avg_rating']}
         - Rata-rata jumlah ulasan: {analysis_results['statistics']['avg_reviews']}
         - Total ulasan: {analysis_results['statistics']['total_reviews']}
-        
-        Bisnis dengan rating tertinggi: {analysis_results['highest_rated']['nama']} 
-        (Rating: {analysis_results['highest_rated']['rating']}, 
+
+        Bisnis dengan rating tertinggi: {analysis_results['highest_rated']['nama']}
+        (Rating: {analysis_results['highest_rated']['rating']},
         Ulasan: {analysis_results['highest_rated']['jumlah_ulasan']},
         Kategori: {analysis_results['highest_rated']['kategori']})
-        
+
         Bisnis dengan ulasan terbanyak: {analysis_results['most_reviewed']['nama']}
-        (Rating: {analysis_results['most_reviewed']['rating']}, 
+        (Rating: {analysis_results['most_reviewed']['rating']},
         Ulasan: {analysis_results['most_reviewed']['jumlah_ulasan']},
         Kategori: {analysis_results['most_reviewed']['kategori']})
-        
+
         Bisnis dengan rating terendah: {analysis_results['lowest_rated']['nama']}
-        (Rating: {analysis_results['lowest_rated']['rating']}, 
+        (Rating: {analysis_results['lowest_rated']['rating']},
         Ulasan: {analysis_results['lowest_rated']['jumlah_ulasan']},
         Kategori: {analysis_results['lowest_rated']['kategori']})
         """
+
+        # Tambahkan hasil clustering jika tersedia
         if analysis_results.get('cluster_analysis', {}).get('enabled'):
-            cluster_lines = ['\nHasil clustering k-means:']
-            cluster_lines.append(f"- Jumlah cluster: {analysis_results['cluster_analysis']['num_clusters']}")
-            for cluster in analysis_results['cluster_analysis']['clusters']:
+            cluster_lines = ['\nHasil clustering K-Means:']
+
+            cluster_analysis = analysis_results['cluster_analysis']
+
+            cluster_lines.append(
+                f"- Jumlah cluster: {cluster_analysis['num_clusters']}"
+            )
+
+            for cluster in cluster_analysis['clusters']:
                 cluster_lines.append(
-                    f"- Cluster {cluster['cluster_id']} ({cluster['label']}): {cluster['count']} bisnis, rata-rata rating {cluster['avg_rating']}, rata-rata ulasan {cluster['avg_reviews']}"
+                    f"- Cluster {cluster['cluster_id']} "
+                    f"({cluster['label']}): "
+                    f"{cluster['count']} bisnis, "
+                    f"rata-rata rating {cluster['avg_rating']}, "
+                    f"rata-rata ulasan {cluster['avg_reviews']}"
                 )
-            for sample in analysis_results['cluster_analysis'].get('cluster_sample', []):
+
+            for sample in cluster_analysis.get('cluster_sample', []):
                 if sample.get('top_businesses'):
                     cluster_lines.append(
-                        f"  Contoh bisnis cluster {sample['cluster_id']} ({sample['label']}): {', '.join(sample['top_businesses'])}"
+                        f"  Contoh bisnis cluster "
+                        f"{sample['cluster_id']} "
+                        f"({sample['label']}): "
+                        f"{', '.join(sample['top_businesses'])}"
                     )
+
             data_summary += '\n'.join(cluster_lines)
-        
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {
-                    "role": "user", 
-                    "content": f"""
-                    Berikan analisis insights bisnis berdasarkan data berikut:
-                    
-                    {data_summary}
-                    
-                    Berikan analisis tentang:
-                    1. Kualitas layanan secara keseluruhan berdasarkan distribusi rating
-                    2. Popularitas bisnis berdasarkan jumlah ulasan
-                    3. Rekomendasi strategi untuk meningkatkan rating dan ulasan
-                    4. Pola atau tren yang terlihat dari data
-                    5. Insight tentang kategori usaha yang performa baik
-                    6. Saran improvement untuk bisnis dengan rating rendah
-                    7. Interpretasi hasil clustering k-means: jelaskan karakteristik setiap cluster dan rekomendasi operasional untuk masing-masing
-                    
-                    Format respons dalam bahasa Indonesia dengan struktur yang jelas dan actionable insights.
-                    """
-                }
-            ],
-            model="llama-3.3-70b-versatile",
-            stream=False,
+
+        prompt = {
+            'role': 'user',
+            'content': f"""
+            Berikan analisis insights bisnis berdasarkan data berikut:
+
+            {data_summary}
+
+            Berikan analisis tentang:
+            1. Kualitas layanan secara keseluruhan berdasarkan distribusi rating
+            2. Popularitas bisnis berdasarkan jumlah ulasan
+            3. Rekomendasi strategi untuk meningkatkan rating dan ulasan
+            4. Pola atau tren yang terlihat dari data
+            5. Insight tentang kategori usaha yang performa baik
+            6. Saran improvement untuk bisnis dengan rating rendah
+            7. Interpretasi hasil clustering K-Means:
+               jelaskan karakteristik setiap cluster dan
+               rekomendasi operasional untuk masing-masing cluster.
+
+            Format respons dalam bahasa Indonesia dengan
+            struktur yang jelas dan actionable insights.
+            """
+        }
+
+        # =====================================================
+        # MODEL YANG DIIZINKAN
+        # =====================================================
+        # Sengaja tidak menggunakan client.models.list()
+        # agar model yang diblokir project tidak ikut dipanggil.
+        candidate_models = [
+            'openai/gpt-oss-20b',    # lebih cepat & murah, cukup untuk analisis ringkas
+            'openai/gpt-oss-120b',   # kualitas lebih baik, fallback jika model kecil gagal
+        ]
+
+        for model_name in candidate_models:
+            try:
+                print(f"Mencoba Groq model: {model_name}")
+
+                completion = client.chat.completions.create(
+                    messages=[prompt],
+                    model=model_name,
+                    stream=False,
+                    temperature=0.5,
+                )
+
+                content = completion.choices[0].message.content
+
+                if content:
+                    print(f"Berhasil menggunakan model: {model_name}")
+                    return content
+
+            except APIStatusError as exc:
+                last_error = exc
+                print(
+                    f"Groq model {model_name} gagal "
+                    f"(status {exc.status_code}): {exc.message}"
+                )
+
+                # 403 / permission_blocked -> lanjut ke model berikutnya
+                if exc.status_code == 403:
+                    continue
+                continue
+
+            except Exception as exc:
+                last_error = exc
+                print(f"Groq model {model_name} gagal (error lain): {exc}")
+                continue
+
+        # =====================================================
+        # SEMUA MODEL GAGAL
+        # =====================================================
+        if last_error is not None:
+            print(f"Error AI call terakhir: {last_error}")
+            return (
+                "Maaf, analisis AI tidak dapat dijalankan. "
+                "Model Groq yang tersedia untuk project Anda "
+                "tidak dapat digunakan. "
+                "Silakan periksa GROQ_API_KEY dan model yang "
+                "diaktifkan pada project Groq."
+            )
+
+        return (
+            "Maaf, tidak ada model Groq yang dapat digunakan "
+            "untuk project Anda."
         )
-        ai_output = chat_completion.choices[0].message.content
-    
-        return ai_output
-    
+
     except Exception as e:
         print(f"Error AI call: {e}")
-        return "Maaf, terjadi kesalahan dalam menganalisis data dengan AI."
+        return (
+            "Maaf, terjadi kesalahan dalam menganalisis "
+            "data dengan AI."
+        )
 
 @app.route('/')
 def main():
@@ -455,7 +579,7 @@ def static_files(filename):
 
 @app.route('/analyze', methods=['GET', 'POST'])
 def analyze_business():
-    global uploaded_data
+    global uploaded_data, clustered_data
     
     if request.method == 'POST':
         # Cek apakah file ada dalam request
@@ -510,7 +634,7 @@ def analyze_business():
 @app.route('/close_analysis', methods=['POST'])
 def close_analysis():
     """Route untuk menutup hasil analisis dan mereset data"""
-    global uploaded_data
+    global uploaded_data, clustered_data
     
     # Reset global data
     uploaded_data = None
@@ -703,6 +827,39 @@ def download_template():
     except Exception as e:
         flash(f"Error membuat template CSV: {str(e)}", "error")
         return redirect(url_for("analyze_business"))
+
+@app.route('/debug_models')
+def debug_models():
+    """Endpoint sementara untuk cek model Groq yang aktif di project ini."""
+    if client is None:
+        return jsonify({
+            'error': 'GROQ_API_KEY belum diatur di environment.'
+        }), 500
+
+    try:
+        model_list = client.models.list()
+        items = getattr(model_list, 'data', []) or []
+
+        models_info = []
+        for item in items:
+            models_info.append({
+                'id': getattr(item, 'id', None),
+                'active': getattr(item, 'active', None),
+                'owned_by': getattr(item, 'owned_by', None),
+                'context_window': getattr(item, 'context_window', None),
+            })
+
+        return jsonify({
+            'success': True,
+            'total_models': len(models_info),
+            'models': models_info
+        })
+
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
     
 
 if __name__ == "__main__":
